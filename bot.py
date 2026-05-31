@@ -1,302 +1,484 @@
 import os
 import json
 import asyncio
-from datetime import datetime, time
+import random
+from datetime import datetime, time, date
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, JobQueue
+    filters, ContextTypes
 )
 import anthropic
+import gspread
+from google.oauth2.service_account import Credentials
 
-# ── Configuración ──────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+# ── Config ─────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-YOUR_CHAT_ID = int(os.environ["YOUR_CHAT_ID"])
-TIMEZONE = os.environ.get("TIMEZONE", "Europe/Paris")
+YOUR_CHAT_ID     = int(os.environ["YOUR_CHAT_ID"])
+TIMEZONE         = os.environ.get("TIMEZONE", "Europe/Paris")
+SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID", "")  # ID del Google Sheet
+
+# Google Sheets setup
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+
+def get_sheets_client():
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+    if not creds_json:
+        return None
+    try:
+        creds_data = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_data, scopes=SCOPES)
+        return gspread.authorize(creds)
+    except Exception as e:
+        print(f"Sheets auth error: {e}")
+        return None
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
 DATA_FILE = "data.json"
 
 SYSTEM_PROMPT = """Sos un asistente de salud personal. Tu usuario se llama Mariano.
 
 CONTEXTO MÉDICO (MUY IMPORTANTE):
 - Tiene desprendimiento de retina por neovascularización macular, posible PXE (pseudoxantoma elástico)
-- Evitar ejercicios de alto impacto, maniobras de Valsalva, levantamiento de pesos muy pesados (>15kg)
-- No recomendar ejercicio de alta intensidad que eleve mucho la presión ocular
-- Siempre sugerir ejercicios de bajo-moderado impacto
+- Evitar ejercicios de alto impacto, maniobras de Valsalva, levantamiento de pesos >15kg
+- No recomendar HIIT, sprints, ni ejercicio que eleve mucho la presión intraocular
+- Ejercicios seguros: caminata, trote suave, bicicleta, natación, máquinas con peso moderado, pilates
 
 OBJETIVO:
-- Bajar de 87kg a 78kg
+- Bajar de 87kg a 78kg (déficit calórico ~300-400 kcal/día)
 - Dieta mediterránea antiinflamatoria
-- Come en la cantina del trabajo los días de semana al mediodía
-- Cena en familia todas las noches
-- Gym aproximadamente 2 veces por semana
-- También puede salir a correr
+- Come en la cantina del trabajo los días de semana al mediodía (12:00)
+- Cena en familia todas las noches a las 20:00
+- Gym los martes y jueves al mediodía (~12:00)
+- También puede salir a correr (trote suave)
 
-DIETA ANTIINFLAMATORIA - priorizar:
-- Pescado azul (salmón, sardinas, caballa), aceite de oliva, nueces
-- Verduras de hoja verde, brócoli, espinaca
-- Frutos rojos, cúrcuma, jengibre, té verde
-- Legumbres, cereales integrales
-- Evitar: azúcar refinada, harinas blancas, frituras, alcohol en exceso, carnes procesadas
+DIETA ANTIINFLAMATORIA — priorizar:
+- Pescado azul (salmón, sardinas, caballa, atún), aceite de oliva extra virgen, nueces
+- Verduras de hoja verde, brócoli, espinaca, tomate, pimiento, zanahoria
+- Frutos rojos, naranja, manzana · Cúrcuma, jengibre, ajo
+- Legumbres, cereales integrales, arroz integral, quínoa
+- Evitar: azúcar refinada, harinas blancas, frituras, embutidos, alcohol en exceso
 
-ESTILO DE RESPUESTA:
-- Respuestas concisas y prácticas
-- En español rioplatense (vos, etc.)
-- Si habla de síntomas oculares nuevos, recordarle que consulte al oftalmólogo
-- Para preguntas sobre ejercicio, siempre considerar la restricción ocular
-- Máximo 3-4 opciones cuando sugieras comidas o ejercicios"""
+CUANDO TENÉS DATOS DE HUME (composición corporal):
+- Si el % de grasa baja pero el peso no → bien, estás perdiendo grasa y ganando músculo
+- Si la masa muscular baja → aumentar proteína (objetivo: ~1.6g/kg/día = ~139g/día)
+- Si la grasa visceral es alta → priorizar déficit calórico y ejercicio cardiovascular suave
+- Usar estos datos para ajustar recomendaciones de forma precisa
 
+ESTILO: español rioplatense, respuestas concretas máximo 250 palabras."""
 
-# ── Persistencia de datos ──────────────────────────────────────────────────────
+RUTINAS_GYM = [
+    {"nombre": "Rutina A — Tren superior", "ejercicios": [
+        ("Bicicleta estática suave", "10 min calentamiento"),
+        ("Press de pecho en máquina", "3×12 — peso moderado, exhalar al empujar"),
+        ("Remo en polea baja", "3×12 — no retener el aliento"),
+        ("Hombros con mancuernas sentado", "3×12 — máx 6-8 kg"),
+        ("Curl de bíceps en máquina", "3×15"),
+        ("Tríceps en polea", "3×15"),
+        ("Plancha frontal", "3×30 seg — respirar normal"),
+        ("Caminata + estiramiento", "10 min vuelta calma"),
+    ]},
+    {"nombre": "Rutina B — Tren inferior", "ejercicios": [
+        ("Caminata en cinta 5km/h", "10 min calentamiento"),
+        ("Prensa de piernas en máquina", "3×12 — exhalar al empujar"),
+        ("Extensión de cuádriceps", "3×15"),
+        ("Curl de isquiotibiales", "3×15"),
+        ("Abductores en máquina", "3×15"),
+        ("Elevación de talones sentado", "3×20"),
+        ("Plancha lateral", "3×20 seg c/lado"),
+        ("Estiramiento cadena posterior", "8 min"),
+    ]},
+    {"nombre": "Rutina C — Full body", "ejercicios": [
+        ("Bicicleta o caminata suave", "8 min"),
+        ("Sentadilla en Smith (peso mínimo)", "3×12 — exhalar al subir"),
+        ("Remo con mancuerna apoyado", "3×12 c/lado — máx 10 kg"),
+        ("Press inclinado en máquina", "3×12"),
+        ("Step aeróbico suave (sin saltos)", "3×1 min"),
+        ("Face pull en polea", "3×15"),
+        ("Abdominales en máquina", "3×15 — exhalar al contraer"),
+        ("Estiramiento completo", "8 min"),
+    ]},
+]
+
+SUGERENCIAS_DESAYUNO = [
+    "🥣 Avena cocida con manzana, canela y nueces — sin azúcar",
+    "🥚 2 huevos revueltos + tostada integral + tomate con aceite de oliva",
+    "🫙 Yogur natural (sin azúcar) + frutos rojos + semillas de chía",
+    "🍌 Smoothie: banana + espinaca + leche + 1 cda mantequilla de almendras",
+    "🧇 Tostada integral + palta + huevo pochado + pimienta negra",
+]
+SUGERENCIAS_ALMUERZO = [
+    "🐟 Salmón al horno + ensalada de espinaca + arroz integral",
+    "🥗 Ensalada de garbanzos con pimiento, pepino, aceitunas y aceite de oliva",
+    "🍗 Pechuga de pollo a la plancha + brócoli al vapor + quínoa",
+    "🫘 Lentejas estofadas con verduras + ensalada verde",
+    "🐠 Atún al natural + ensalada mixta + tostada integral",
+]
+SUGERENCIAS_CENA = [
+    "🥗 Ensalada de rúcula con sardinas, tomate cherry y aceite de oliva",
+    "🍳 Tortilla de espinaca y champiñones (2 huevos) + ensalada",
+    "🥣 Sopa de lentejas con cúrcuma y jengibre + tostada integral",
+    "🐟 Merluza al horno con ajo, limón y pimiento",
+    "🫘 Bowl de garbanzos con espinaca salteada y aceite de oliva",
+]
+
+# ── Persistencia ───────────────────────────────────────────────────────────────
 def load_data():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
+        with open(DATA_FILE) as f:
             return json.load(f)
-    return {"peso_history": [], "conversation_history": [], "last_check_in": None}
-
+    return {"peso_history": [], "hume_history": [], "conversation_history": [], "rutina_index": 0}
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+# ── Google Sheets ──────────────────────────────────────────────────────────────
+def write_peso_to_sheets(fecha: str, peso: float, extra: dict = None):
+    """Escribe un registro de peso en la hoja 'Registro semanal'."""
+    gc = get_sheets_client()
+    if not gc or not SPREADSHEET_ID:
+        return False
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        ws = sh.worksheet("Registro semanal")
+        all_vals = ws.col_values(1)  # columna de fechas
+        next_row = len([v for v in all_vals if v]) + 1
+        if next_row < 5:
+            next_row = 5
 
-# ── Llamada a Claude ───────────────────────────────────────────────────────────
-def ask_claude(user_message: str, history: list) -> str:
+        row_data = [fecha, "", peso,
+                    extra.get("grasa_pct", "") if extra else "",
+                    extra.get("masa_muscular", "") if extra else "",
+                    extra.get("grasa_visceral", "") if extra else "",
+                    extra.get("edad_metabolica", "") if extra else "",
+                    "", "", "", ""]
+        ws.update(f"A{next_row}:K{next_row}", [row_data])
+        return True
+    except Exception as e:
+        print(f"Sheets write error: {e}")
+        return False
+
+def read_last_hume_from_sheets():
+    """Lee la última medición completa de Hume desde Sheets."""
+    gc = get_sheets_client()
+    if not gc or not SPREADSHEET_ID:
+        return None
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        ws = sh.worksheet("Registro semanal")
+        data = ws.get_all_values()
+        for row in reversed(data[4:]):  # saltar encabezados
+            if row[2] and row[3]:  # peso y % grasa ambos presentes
+                return {
+                    "fecha": row[0],
+                    "peso": row[2],
+                    "grasa_pct": row[3],
+                    "masa_muscular": row[4],
+                    "grasa_visceral": row[5],
+                    "edad_metabolica": row[6],
+                }
+        return None
+    except Exception as e:
+        print(f"Sheets read error: {e}")
+        return None
+
+# ── Claude ─────────────────────────────────────────────────────────────────────
+def ask_claude(user_message: str, history: list, hume_context: str = "") -> str:
+    system = SYSTEM_PROMPT
+    if hume_context:
+        system += f"\n\nÚLTIMOS DATOS DE HUME HEALTH (usar para personalizar respuesta):\n{hume_context}"
     messages = history[-10:] + [{"role": "user", "content": user_message}]
-    response = client.messages.create(
+    resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=600,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=messages
     )
-    return response.content[0].text
+    return resp.content[0].text
 
+def build_hume_context(data: dict) -> str:
+    last = read_last_hume_from_sheets()
+    if not last:
+        h = data.get("hume_history", [])
+        last = h[-1] if h else None
+    if not last:
+        return ""
+    lines = [f"Fecha medición: {last.get('fecha', 'N/D')}",
+             f"Peso: {last.get('peso', 'N/D')} kg",
+             f"% Grasa corporal: {last.get('grasa_pct', 'N/D')}",
+             f"Masa muscular: {last.get('masa_muscular', 'N/D')} kg",
+             f"Grasa visceral: {last.get('grasa_visceral', 'N/D')}",
+             f"Edad metabólica: {last.get('edad_metabolica', 'N/D')}"]
+    return "\n".join(lines)
 
-# ── Teclado rápido ─────────────────────────────────────────────────────────────
+# ── Teclado ────────────────────────────────────────────────────────────────────
 def main_keyboard():
-    keyboard = [
-        [KeyboardButton("⚖️ Registrar peso"), KeyboardButton("🥗 ¿Qué como hoy?")],
-        [KeyboardButton("💪 Rutina de gym"), KeyboardButton("🏃 Salir a correr")],
-        [KeyboardButton("📊 Mi progreso"), KeyboardButton("📋 Check-in semanal")],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("⚖️ Registrar peso"), KeyboardButton("🥗 Sugerencia comida")],
+        [KeyboardButton("💪 Rutina de gym"),  KeyboardButton("🏃 Salir a correr")],
+        [KeyboardButton("📊 Mi progreso"),    KeyboardButton("📋 Check-in semanal")],
+        [KeyboardButton("🔬 Actualizar Hume")],
+    ], resize_keyboard=True)
 
+def formato_rutina(r: dict) -> str:
+    lines = [f"💪 *{r['nombre']}*\n"]
+    for ej, det in r["ejercicios"]:
+        lines.append(f"• {ej}: _{det}_")
+    lines.append("\n⚠️ Respirá siempre durante el ejercicio. Sin retener el aliento.")
+    return "\n".join(lines)
 
 # ── Comandos ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "¡Hola Mariano! 👋 Soy tu asistente de salud.\n\n"
-        "Podés escribirme lo que quieras o usar los botones rápidos.",
-        reply_markup=main_keyboard()
+        "Tip: después de medirte con el Hume, tocá *🔬 Actualizar Hume* para que pueda darte recomendaciones precisas.",
+        parse_mode="Markdown", reply_markup=main_keyboard()
     )
-
-
-async def cmd_peso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "¿Cuánto pesás hoy? (escribí solo el número, ej: 86.5)"
-    )
-    context.user_data["esperando_peso"] = True
-
 
 async def cmd_progreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     history = data.get("peso_history", [])
     if not history:
-        await update.message.reply_text("Todavía no registraste ningún peso. Usá ⚖️ Registrar peso para empezar.")
+        await update.message.reply_text("Todavía no registraste ningún peso. Usá ⚖️ para empezar.", reply_markup=main_keyboard())
         return
-
-    ultimo = history[-1]
+    actual = history[-1]["peso"]
     inicio = history[0]["peso"]
-    actual = ultimo["peso"]
-    bajado = inicio - actual
-    falta = actual - 78.0
+    bajado = round(inicio - actual, 1)
+    falta  = round(actual - 78.0, 1)
+    pct    = round((bajado / max(inicio - 78.0, 0.01)) * 100)
 
-    lines = [f"📊 *Tu progreso*\n"]
-    lines.append(f"Peso actual: *{actual} kg*")
-    lines.append(f"Bajaste: *{bajado:.1f} kg* desde que empezaste ({inicio} kg)")
-    lines.append(f"Te faltan: *{falta:.1f} kg* para llegar a 78 kg")
+    lines = ["📊 *Tu progreso*\n",
+             f"Peso actual: *{actual} kg*",
+             f"Objetivo: *78 kg* — te faltan *{falta} kg*",
+             f"Bajaste *{bajado} kg* ({pct}% del camino)"]
 
     if len(history) >= 2:
-        anterior = history[-2]["peso"]
-        diff = actual - anterior
-        emoji = "📉" if diff < 0 else "📈" if diff > 0 else "➡️"
-        lines.append(f"Vs. medición anterior: {emoji} {diff:+.1f} kg")
+        diff = round(actual - history[-2]["peso"], 1)
+        lines.append(f"Vs semana anterior: {'📉' if diff<0 else '📈'} {diff:+.1f} kg")
 
-    lines.append(f"\n_Últimas mediciones:_")
-    for entry in history[-5:]:
-        lines.append(f"  {entry['fecha']}: {entry['peso']} kg")
+    # Agregar datos Hume si hay
+    hume = build_hume_context(data)
+    if hume:
+        lines.append("\n🔬 *Última medición Hume:*")
+        for line in hume.split("\n"):
+            lines.append(f"  {line}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    lines.append("\n_Últimas mediciones:_")
+    for e in history[-5:]:
+        lines.append(f"  {e['fecha']}: {e['peso']} kg")
 
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_keyboard())
 
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Check-in semanal*\n\n"
-        "Contame cómo fue la semana. Podés incluir:\n"
-        "• Peso actual\n"
-        "• Cuántas veces fuiste al gym / corriste\n"
-        "• Cómo estuvo la dieta (del 1 al 5)\n"
-        "• Cómo te sentiste (energía, sueño, etc.)\n\n"
-        "Escribilo en lenguaje natural, yo lo analizo.",
+        "Contame cómo fue la semana:\n"
+        "• Peso actual\n• Gym / running (veces y km)\n"
+        "• Dieta (1-5)\n• Energía y sueño\n\n"
+        "Si te mediste con el Hume esta semana, incluí los datos.",
         parse_mode="Markdown"
     )
 
+async def cmd_hume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔬 *Actualizar datos de Hume*\n\n"
+        "Mandame los datos de tu última medición. Podés escribirlos así:\n\n"
+        "`peso: 86.2\ngrasa: 28.5%\nmúsculo: 58.1 kg\ngrasa visceral: 9\nedad metabólica: 42`\n\n"
+        "O simplemente una foto/captura de la app y lo leo yo.",
+        parse_mode="Markdown"
+    )
+    context.user_data["esperando_hume"] = True
 
-# ── Manejador de mensajes de texto ────────────────────────────────────────────
+# ── Manejador principal ────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     data = load_data()
 
-    # Registrar peso numérico
-    if context.user_data.get("esperando_peso") or text.replace(".", "").replace(",", "").isdigit():
+    # ── Registro de peso ──
+    if context.user_data.get("esperando_peso"):
         try:
             peso = float(text.replace(",", "."))
             if 40 < peso < 200:
-                entry = {
-                    "fecha": datetime.now(pytz.timezone(TIMEZONE)).strftime("%d/%m/%Y"),
-                    "peso": peso
-                }
-                data["peso_history"].append(entry)
+                tz = pytz.timezone(TIMEZONE)
+                fecha = datetime.now(tz).strftime("%d/%m/%Y")
+                data["peso_history"].append({"fecha": fecha, "peso": peso})
                 save_data(data)
                 context.user_data["esperando_peso"] = False
-
-                falta = peso - 78.0
-                msg = f"✅ Peso registrado: *{peso} kg*\nTe faltan *{falta:.1f} kg* para tu objetivo."
-                await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard())
+                # Escribir en Sheets
+                sheets_ok = write_peso_to_sheets(fecha, peso)
+                falta = round(peso - 78.0, 1)
+                sheets_msg = " ✅ Guardado en Google Sheets." if sheets_ok else ""
+                await update.message.reply_text(
+                    f"✅ Peso registrado: *{peso} kg*\nTe faltan *{falta} kg* para llegar a 78.{sheets_msg}",
+                    parse_mode="Markdown", reply_markup=main_keyboard()
+                )
                 return
         except ValueError:
             pass
 
-    # Botones rápidos → convertir a mensaje natural
-    quick_map = {
-        "⚖️ Registrar peso": "Quiero registrar mi peso de hoy",
-        "🥗 ¿Qué como hoy?": "¿Qué me recomendás comer hoy? Desayuno, almuerzo en cantina y cena. Dieta mediterránea antiinflamatoria.",
-        "💪 Rutina de gym": "Dame una rutina de gym para hoy, considerando mi restricción ocular.",
-        "🏃 Salir a correr": "Voy a salir a correr, ¿qué me recomendás en cuanto a distancia, ritmo y calentamiento?",
-        "📊 Mi progreso": None,
-        "📋 Check-in semanal": None,
-    }
+    # ── Datos de Hume ──
+    if context.user_data.get("esperando_hume"):
+        context.user_data["esperando_hume"] = False
+        # Parsear datos de Hume del texto libre con Claude
+        parse_prompt = (
+            f"El usuario mandó estos datos de su scanner Hume Health:\n\n{text}\n\n"
+            "Extraé los valores numéricos y devolvé SOLO un JSON con estas claves "
+            "(usa null si no está): peso, grasa_pct, masa_muscular, grasa_visceral, edad_metabolica. "
+            "Solo el JSON, sin texto extra."
+        )
+        try:
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=200,
+                messages=[{"role": "user", "content": parse_prompt}]
+            )
+            raw = resp.content[0].text.strip()
+            hume_data = json.loads(raw)
+            tz = pytz.timezone(TIMEZONE)
+            hume_data["fecha"] = datetime.now(tz).strftime("%d/%m/%Y")
+            data.setdefault("hume_history", []).append(hume_data)
+            save_data(data)
+            # Escribir en Sheets si hay peso
+            if hume_data.get("peso"):
+                write_peso_to_sheets(hume_data["fecha"], hume_data["peso"], hume_data)
 
+            # Generar análisis
+            ctx = "\n".join(f"{k}: {v}" for k, v in hume_data.items() if v)
+            analisis = ask_claude(
+                "Analizá estos datos de composición corporal y dame un feedback concreto sobre mi progreso.",
+                data.get("conversation_history", []),
+                hume_context=ctx
+            )
+            await update.message.reply_text(
+                f"🔬 *Datos Hume guardados*\n\n{analisis}",
+                parse_mode="Markdown", reply_markup=main_keyboard()
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                "No pude parsear los datos. Intentá con el formato:\n`peso: 86.2 / grasa: 28% / músculo: 58kg`",
+                parse_mode="Markdown"
+            )
+        return
+
+    # ── Botones rápidos ──
     if text == "⚖️ Registrar peso":
         context.user_data["esperando_peso"] = True
         await update.message.reply_text("¿Cuánto pesás hoy? (ej: 86.5)")
         return
     if text == "📊 Mi progreso":
-        await cmd_progreso(update, context)
-        return
+        await cmd_progreso(update, context); return
     if text == "📋 Check-in semanal":
-        await cmd_checkin(update, context)
+        await cmd_checkin(update, context); return
+    if text == "🔬 Actualizar Hume":
+        await cmd_hume(update, context); return
+
+    if text == "💪 Rutina de gym":
+        idx = data.get("rutina_index", 0)
+        rutina = RUTINAS_GYM[idx % len(RUTINAS_GYM)]
+        data["rutina_index"] = (idx + 1) % len(RUTINAS_GYM)
+        save_data(data)
+        await update.message.reply_text(formato_rutina(rutina), parse_mode="Markdown", reply_markup=main_keyboard())
         return
 
-    prompt = quick_map.get(text, text)
+    if text == "🏃 Salir a correr":
+        await update.message.reply_text(
+            "🏃 *Trote suave — plan de hoy*\n\n"
+            "• Calentamiento: 5 min caminata\n"
+            "• Trote: 20-30 min a ritmo de conversación\n"
+            "• Vuelta calma: 5 min caminata\n"
+            "• Estiramiento: 5 min\n\n"
+            "⚠️ Sin sprints. Ritmo constante y cómodo.",
+            parse_mode="Markdown", reply_markup=main_keyboard()
+        )
+        return
 
-    # Llamada a Claude
+    if text == "🥗 Sugerencia comida":
+        tz = pytz.timezone(TIMEZONE)
+        hora = datetime.now(tz).hour
+        if hora < 10:
+            ops = random.sample(SUGERENCIAS_DESAYUNO, 3); titulo = "🌅 *Desayuno*"
+        elif hora < 15:
+            ops = random.sample(SUGERENCIAS_ALMUERZO, 3); titulo = "🍽️ *Almuerzo*"
+        else:
+            ops = random.sample(SUGERENCIAS_CENA, 3); titulo = "🌙 *Cena*"
+        await update.message.reply_text(titulo + "\n\n" + "\n\n".join(ops), parse_mode="Markdown", reply_markup=main_keyboard())
+        return
+
+    # ── Lenguaje natural → Claude ──
     await update.message.chat.send_action("typing")
-    history = data.get("conversation_history", [])
-    response = ask_claude(prompt, history)
-
-    # Guardar en historial (máximo 20 turnos)
-    history.append({"role": "user", "content": prompt})
-    history.append({"role": "assistant", "content": response})
-    data["conversation_history"] = history[-20:]
+    hume_ctx = build_hume_context(data)
+    hist = data.get("conversation_history", [])
+    response = ask_claude(text, hist, hume_context=hume_ctx)
+    hist.append({"role": "user", "content": text})
+    hist.append({"role": "assistant", "content": response})
+    data["conversation_history"] = hist[-20:]
     save_data(data)
-
     await update.message.reply_text(response, reply_markup=main_keyboard())
 
-
-# ── Recordatorios automáticos ─────────────────────────────────────────────────
+# ── Recordatorios ──────────────────────────────────────────────────────────────
 async def recordatorio_peso_lunes(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=YOUR_CHAT_ID,
-        text="⚖️ *Check-in del lunes*\n\n¿Cuánto pesás hoy? Pesate en ayunas y registrá tu peso.",
-        parse_mode="Markdown"
-    )
-
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID,
+        text="⚖️ *Lunes — pesate en ayunas*\nRegistrá tu peso tocando ⚖️ en el menú.\nSi te mediste con el Hume, actualizá esos datos también 🔬",
+        parse_mode="Markdown")
 
 async def recordatorio_desayuno(context: ContextTypes.DEFAULT_TYPE):
     tz = pytz.timezone(TIMEZONE)
-    hoy = datetime.now(tz)
-    dia = hoy.weekday()  # 0=lunes, 6=domingo
-    es_finde = dia >= 5
-
-    if es_finde:
-        msg = "🌅 *Buenos días*\nEs fin de semana — buena oportunidad para un desayuno mediterráneo completo: huevos + tostada integral + aceite de oliva + fruta."
-    else:
-        msg = "🌅 *Buenos días*\nRecordá empezar bien: yogur natural + frutos rojos + nueces, o avena con canela y manzana. Evitá el azúcar refinada."
-    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
-
+    es_finde = datetime.now(tz).weekday() >= 5
+    ops = random.sample(SUGERENCIAS_DESAYUNO, 2)
+    intro = "🌅 *Buenos días Mariano*" + (" — fin de semana, desayuná bien:" if es_finde else ":")
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID,
+        text=intro + "\n\n" + "\n\n".join(ops), parse_mode="Markdown")
 
 async def recordatorio_almuerzo(context: ContextTypes.DEFAULT_TYPE):
     tz = pytz.timezone(TIMEZONE)
-    hoy = datetime.now(tz)
-    dia = hoy.weekday()
-    if dia < 5:  # solo días de semana
-        await context.bot.send_message(
-            chat_id=YOUR_CHAT_ID,
-            text="🍽️ *Almuerzo en la cantina*\nOpciones antiinflamatorias: pescado > pollo > legumbres. Priorizá verduras, evitá frituras y harinas blancas. Agua o té verde.",
-            parse_mode="Markdown"
-        )
-
-
-async def recordatorio_cena(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=YOUR_CHAT_ID,
-        text="🌙 *Hora de cenar*\nRecordá: proteína magra o legumbres, verduras, aceite de oliva. Cena liviana si ya almorzaste abundante.",
-        parse_mode="Markdown"
-    )
-
+    if datetime.now(tz).weekday() >= 5:
+        return
+    ops = random.sample(SUGERENCIAS_ALMUERZO, 2)
+    msg = "🍽️ *Almuerzo — opciones para hoy:*\n\n" + "\n\n".join(ops)
+    msg += "\n\n_Si la cantina no tiene esto: proteína magra + verduras + sin frituras._"
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
 
 async def recordatorio_gym(context: ContextTypes.DEFAULT_TYPE):
     tz = pytz.timezone(TIMEZONE)
-    dia = tz.localize(datetime.now()).weekday()
-    # Sugerir gym martes y jueves
-    if dia in [1, 3]:
-        await context.bot.send_message(
-            chat_id=YOUR_CHAT_ID,
-            text="💪 *¿Vas al gym hoy?*\nSi podés, es un buen día. Recordá ejercicios de bajo impacto y sin maniobras de Valsalva. Escribime 'Rutina de gym' y te armo una.",
-            parse_mode="Markdown"
-        )
+    if datetime.now(tz).weekday() not in [1, 3]:
+        return
+    data = load_data()
+    idx = data.get("rutina_index", 0)
+    rutina = RUTINAS_GYM[idx % len(RUTINAS_GYM)]
+    data["rutina_index"] = (idx + 1) % len(RUTINAS_GYM)
+    save_data(data)
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID,
+        text="💪 *Hoy es día de gym — acá tu rutina:*\n\n" + formato_rutina(rutina),
+        parse_mode="Markdown")
 
+async def recordatorio_cena(context: ContextTypes.DEFAULT_TYPE):
+    ops = random.sample(SUGERENCIAS_CENA, 2)
+    msg = "🌙 *Cena — sugerencias para esta noche:*\n\n" + "\n\n".join(ops)
+    msg += "\n\n_Liviano si almorzaste bien._"
+    await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("peso", cmd_peso))
     app.add_handler(CommandHandler("progreso", cmd_progreso))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
-
-    # Mensajes de texto
+    app.add_handler(CommandHandler("hume", cmd_hume))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Programar recordatorios
     tz = pytz.timezone(TIMEZONE)
     jq = app.job_queue
-
-    # Lunes 8:00 → check-in de peso
-    jq.run_daily(recordatorio_peso_lunes, time=time(8, 0, tzinfo=tz), days=(0,))
-
-    # Todos los días 8:00 → desayuno
-    jq.run_daily(recordatorio_desayuno, time=time(8, 0, tzinfo=tz))
-
-    # Días de semana 12:30 → almuerzo
-    jq.run_daily(recordatorio_almuerzo, time=time(12, 30, tzinfo=tz), days=(0, 1, 2, 3, 4))
-
-    # Todos los días 20:00 → cena
-    jq.run_daily(recordatorio_cena, time=time(20, 0, tzinfo=tz))
-
-    # Martes y jueves 17:30 → gym
-    jq.run_daily(recordatorio_gym, time=time(17, 30, tzinfo=tz), days=(1, 3))
+    jq.run_daily(recordatorio_peso_lunes, time=time(8,  0, tzinfo=tz), days=(0,))
+    jq.run_daily(recordatorio_desayuno,   time=time(8,  0, tzinfo=tz))
+    jq.run_daily(recordatorio_almuerzo,   time=time(11, 30, tzinfo=tz), days=(0,1,2,3,4))
+    jq.run_daily(recordatorio_gym,        time=time(11, 30, tzinfo=tz), days=(1,3))
+    jq.run_daily(recordatorio_cena,       time=time(19, 30, tzinfo=tz))
 
     print("Bot iniciado ✅")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
