@@ -507,12 +507,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         sheets_msg = " ✅ Guardado en Sheets." if sheets_ok else ""
+        datos_lines = "\n".join(f"• {k}: {v}" for k, v in hume_data.items() if k != "fecha")
+        msg = f"🔬 *Datos extraídos de la imagen:*\n\n{datos_lines}\n\n{analisis}{sheets_msg}"
         await update.message.reply_text(
-            f"🔬 *Datos extraídos de la imagen:*
-
-"
-            + "\n".join(f"• {k}: {v}" for k, v in hume_data.items() if k != "fecha")
-            + f"\n\n{analisis}{sheets_msg}",
+            msg,
             parse_mode="Markdown",
             reply_markup=main_keyboard()
         )
