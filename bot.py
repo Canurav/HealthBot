@@ -461,7 +461,17 @@ async def recordatorio_cena(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-def main():
+async def main():
+    import httpx
+
+    # Cerrar cualquier sesión de polling anterior en Telegram
+    async with httpx.AsyncClient() as hclient:
+        await hclient.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": True},
+        )
+    await asyncio.sleep(2)  # dar tiempo a que Telegram libere la sesión
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -485,10 +495,11 @@ def main():
     jq.run_daily(recordatorio_cena,       time=time(19, 30, tzinfo=tz))
 
     print("Bot iniciado ✅")
-    app.run_polling(
+    await app.run_polling(
         drop_pending_updates=True,
         allowed_updates=["message"],
+        close_loop=False,
     )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
