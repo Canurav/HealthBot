@@ -27,13 +27,22 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
 def get_sheets_client():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
     if not creds_json:
+        print("Sheets: GOOGLE_CREDENTIALS_JSON no está configurado")
         return None
+    print(f"Sheets: JSON cargado, longitud={len(creds_json)} chars, empieza con: {creds_json[:30]}")
     try:
         creds_data = json.loads(creds_json)
+        print(f"Sheets: JSON parseado OK, client_email={creds_data.get('client_email','?')}")
         creds = Credentials.from_service_account_info(creds_data, scopes=SCOPES)
-        return gspread.authorize(creds)
+        gc = gspread.authorize(creds)
+        print("Sheets: autenticación exitosa ✅")
+        return gc
+    except json.JSONDecodeError as e:
+        print(f"Sheets: JSON inválido — {e}")
+        print(f"Sheets: primeros 100 chars: {repr(creds_json[:100])}")
+        return None
     except Exception as e:
-        print(f"Sheets auth error: {e}")
+        print(f"Sheets: error de autenticación — {e}")
         return None
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
