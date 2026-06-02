@@ -462,7 +462,14 @@ async def recordatorio_cena(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("progreso", cmd_progreso))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
@@ -478,7 +485,10 @@ def main():
     jq.run_daily(recordatorio_cena,       time=time(19, 30, tzinfo=tz))
 
     print("Bot iniciado ✅")
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message"],
+    )
 
 if __name__ == "__main__":
     main()
