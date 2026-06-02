@@ -41,6 +41,16 @@ DATA_FILE = "data.json"
 
 SYSTEM_PROMPT = """Sos un asistente de salud personal. Tu usuario se llama Mariano.
 
+DATOS PERSONALES:
+- Nombre: Mariano
+- Edad: 45 años
+- Altura: 1.77 m
+- Peso inicial: 87 kg → Objetivo: 78 kg
+- IMC actual (87kg): 27.8 (sobrepeso leve) → IMC objetivo (78kg): 24.9 (normal)
+- Requerimiento calórico estimado (TDEE): ~2400 kcal/día actividad moderada
+- Objetivo calórico para bajar: ~2000-2100 kcal/día (déficit 300-400 kcal)
+- Proteína objetivo: ~130-140g/día (1.6g x kg peso objetivo)
+
 CONTEXTO MÉDICO (MUY IMPORTANTE):
 - Tiene desprendimiento de retina por neovascularización macular, posible PXE (pseudoxantoma elástico)
 - Evitar ejercicios de alto impacto, maniobras de Valsalva, levantamiento de pesos >15kg
@@ -418,6 +428,99 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text(response, reply_markup=main_keyboard())
 
+
+# ── Handler de fotos (Hume screenshot) ────────────────────────────────────────
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.chat.send_action("typing")
+
+    # Descargar la foto en máxima resolución
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_bytes = await file.download_as_bytearray()
+    import base64
+    image_b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+    # Mandar a Claude Vision para extraer datos
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64,
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Esta es una captura de la app Hume Health / FitTrack. "
+                            "Extraé todos los valores numéricos de composición corporal que veas. "
+                            "Devolvé SOLO un JSON con estas claves (null si no está): "
+                            "peso, grasa_pct, masa_muscular, grasa_visceral, edad_metabolica, imc. "
+                            "Solo el JSON, sin texto extra ni backticks."
+                        )
+                    }
+                ]
+            }]
+        )
+        raw = resp.content[0].text.strip().strip("```json").strip("```").strip()
+        hume_data = json.loads(raw)
+
+        tz = pytz.timezone(TIMEZONE)
+        hume_data["fecha"] = datetime.now(tz).strftime("%d/%m/%Y")
+
+        # Limpiar nulls
+        hume_data = {k: v for k, v in hume_data.items() if v is not None}
+
+        # Guardar localmente
+        data = load_data()
+        data.setdefault("hume_history", []).append(hume_data)
+        save_data(data)
+
+        # Escribir en Sheets
+        peso = hume_data.get("peso")
+        sheets_ok = False
+        if peso:
+            sheets_ok = write_peso_to_sheets(hume_data["fecha"], float(str(peso).replace(",",".")), hume_data)
+
+        # Generar análisis con Claude
+        ctx = "\n".join(f"{k}: {v}" for k, v in hume_data.items())
+        analisis = ask_claude(
+            "Analizá estos datos de composición corporal y dame feedback concreto sobre mi progreso y qué ajustar.",
+            data.get("conversation_history", []),
+            hume_context=ctx
+        )
+
+        sheets_msg = " ✅ Guardado en Sheets." if sheets_ok else ""
+        await update.message.reply_text(
+            f"🔬 *Datos extraídos de la imagen:*
+
+"
+            + "\n".join(f"• {k}: {v}" for k, v in hume_data.items() if k != "fecha")
+            + f"\n\n{analisis}{sheets_msg}",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard()
+        )
+
+    except (json.JSONDecodeError, KeyError) as e:
+        await update.message.reply_text(
+            "No pude leer los datos de la imagen. "
+            "Intentá con buena iluminación o escribí los valores manualmente con 🔬",
+            reply_markup=main_keyboard()
+        )
+    except Exception as e:
+        print(f"Photo handler error: {e}")
+        await update.message.reply_text(
+            "Hubo un error procesando la imagen. Intentá de nuevo.",
+            reply_markup=main_keyboard()
+        )
+
 # ── Recordatorios ──────────────────────────────────────────────────────────────
 async def recordatorio_peso_lunes(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=YOUR_CHAT_ID,
@@ -488,6 +591,7 @@ def main():
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CommandHandler("hume", cmd_hume))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     tz = pytz.timezone(TIMEZONE)
     jq = app.job_queue
@@ -500,7 +604,7 @@ def main():
     print("Bot iniciado ✅")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message"],
+        allowed_updates=["message", "photo"],
     )
 
 if __name__ == "__main__":
