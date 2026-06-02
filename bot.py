@@ -159,16 +159,22 @@ def save_data(data):
 def write_peso_to_sheets(fecha: str, peso: float, extra: dict = None):
     """Escribe un registro de peso en la hoja 'Registro semanal'."""
     gc = get_sheets_client()
-    if not gc or not SPREADSHEET_ID:
+    if not gc:
+        print("Sheets write: no hay cliente")
+        return False
+    if not SPREADSHEET_ID:
+        print("Sheets write: SPREADSHEET_ID vacío")
         return False
     try:
+        print(f"Sheets write: abriendo spreadsheet {SPREADSHEET_ID}")
         sh = gc.open_by_key(SPREADSHEET_ID)
+        print(f"Sheets write: hojas disponibles = {[w.title for w in sh.worksheets()]}")
         ws = sh.worksheet("Registro semanal")
-        all_vals = ws.col_values(1)  # columna de fechas
+        all_vals = ws.col_values(1)
         next_row = len([v for v in all_vals if v]) + 1
         if next_row < 5:
             next_row = 5
-
+        print(f"Sheets write: escribiendo en fila {next_row}")
         row_data = [fecha, "", peso,
                     extra.get("grasa_pct", "") if extra else "",
                     extra.get("masa_muscular", "") if extra else "",
@@ -176,9 +182,10 @@ def write_peso_to_sheets(fecha: str, peso: float, extra: dict = None):
                     extra.get("edad_metabolica", "") if extra else "",
                     "", "", "", ""]
         ws.update(f"A{next_row}:K{next_row}", [row_data])
+        print(f"Sheets write: ✅ escrito en fila {next_row}")
         return True
     except Exception as e:
-        print(f"Sheets write error: {e}")
+        print(f"Sheets write error: {type(e).__name__}: {e}")
         return False
 
 def read_last_hume_from_sheets():
@@ -572,18 +579,8 @@ async def recordatorio_cena(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    import httpx
-
-    # Cerrar sesión anterior en Telegram antes de arrancar
-    try:
-        import urllib.request, urllib.parse
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook"
-        data = urllib.parse.urlencode({"drop_pending_updates": "true"}).encode()
-        urllib.request.urlopen(url, data=data, timeout=10)
-        import time as time_module
-        time_module.sleep(2)
-    except Exception as e:
-        print(f"deleteWebhook warning: {e}")
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    port = int(os.environ.get("PORT", "8443"))
 
     app = (
         Application.builder()
@@ -608,10 +605,12 @@ def main():
     jq.run_daily(recordatorio_gym,        time=time(11, 30, tzinfo=tz), days=(1,3))
     jq.run_daily(recordatorio_cena,       time=time(19, 30, tzinfo=tz))
 
-    print("Bot iniciado ✅")
-    app.run_polling(
+    print(f"Bot iniciado ✅ — webhook en {webhook_url} puerto {port}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=f"{webhook_url}/{TELEGRAM_TOKEN}",
         drop_pending_updates=True,
-        allowed_updates=["message", "photo"],
     )
 
 if __name__ == "__main__":
